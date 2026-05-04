@@ -1,0 +1,24 @@
+# Gradle / Android
+.gradle/
+build/
+captures/
+local.properties
+.cxx/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Build outputs
+*.apk
+*.aab
+*.dex
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# Logs / scratch
+*.log
+*.hprof
+release-apk/
