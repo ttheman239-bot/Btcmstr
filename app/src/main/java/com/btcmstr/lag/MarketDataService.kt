@@ -33,9 +33,10 @@ class MarketDataService {
             val k = arr.getJSONArray(i)
             // [openTime, open, high, low, close, volume, closeTime, ...]
             val openTime = k.getLong(0)
+            val open = k.getString(1).toDouble()
             val close = k.getString(4).toDouble()
             val volume = k.getString(5).toDouble()
-            out.add(LagFormula.Bar(openTime, close, volume))
+            out.add(LagFormula.Bar(openTime, close, volume, open))
         }
         return out
     }
@@ -75,6 +76,7 @@ class MarketDataService {
         if (quoteArr.length() == 0) return emptyList()
         val quote = quoteArr.getJSONObject(0)
         val closes = quote.optJSONArray("close") ?: return emptyList()
+        val opens = quote.optJSONArray("open")
         val volumes = quote.optJSONArray("volume")
 
         val n = timestamps.length()
@@ -86,10 +88,114 @@ class MarketDataService {
             val close = if (rawClose.isNaN()) lastClose else rawClose
             if (close.isNaN()) continue
             lastClose = close
+            val open = if (opens != null && !opens.isNull(i)) opens.getDouble(i) else close
             val vol = if (volumes != null && !volumes.isNull(i)) volumes.getDouble(i) else 0.0
-            bars.add(LagFormula.Bar(tsMs, close, vol))
+            bars.add(LagFormula.Bar(tsMs, close, vol, open))
         }
         return if (bars.size > limit) bars.subList(bars.size - limit, bars.size) else bars
+    }
+
+    /**
+     * Pages Binance klines back in time so we can cover ranges longer than
+     * the 1000-bar single-call limit. Returns chronological order.
+     */
+    fun fetchBtcKlinesRange(
+        intervalSec: Int,
+        startTimeMs: Long,
+        endTimeMs: Long,
+    ): List<LagFormula.Bar> {
+        val interval = when (intervalSec) {
+            60 -> "1m"
+            300 -> "5m"
+            900 -> "15m"
+            3600 -> "1h"
+            else -> "5m"
+        }
+        val all = ArrayList<LagFormula.Bar>()
+        val seen = HashSet<Long>()
+        var cursor = startTimeMs
+        var hops = 0
+        while (cursor < endTimeMs && hops < 30) {
+            val url = "https://api.binance.com/api/v3/klines" +
+                "?symbol=BTCUSDT&interval=$interval&limit=1000" +
+                "&startTime=$cursor&endTime=$endTimeMs"
+            val body = httpGet(url) ?: break
+            val arr = JSONArray(body)
+            if (arr.length() == 0) break
+            var lastClose = cursor
+            for (i in 0 until arr.length()) {
+                val k = arr.getJSONArray(i)
+                val openTime = k.getLong(0)
+                if (!seen.add(openTime)) continue
+                val open = k.getString(1).toDouble()
+                val close = k.getString(4).toDouble()
+                val volume = k.getString(5).toDouble()
+                all.add(LagFormula.Bar(openTime, close, volume, open))
+                lastClose = k.getLong(6)
+            }
+            if (lastClose <= cursor) break
+            cursor = lastClose + 1
+            hops++
+        }
+        all.sortBy { it.timestampMs }
+        return all
+    }
+
+    /**
+     * Pulls a long aligned history for backtesting. lookbackDays caps at
+     * Yahoo's 5m maximum (60d) to keep one MSTR call simple.
+     */
+    fun fetchHistoricalAligned(
+        intervalSec: Int = 300,
+        lookbackDays: Int = 30,
+    ): Pair<List<LagFormula.Bar>, List<LagFormula.Bar>> {
+        val days = lookbackDays.coerceIn(2, 60)
+        val mstr = fetchMstrBarsRange(intervalSec, days)
+        if (mstr.isEmpty()) return Pair(emptyList(), emptyList())
+        val firstTs = mstr.first().timestampMs
+        val lastTs = mstr.last().timestampMs + intervalSec * 1000L
+        val btc = fetchBtcKlinesRange(intervalSec, firstTs, lastTs)
+        return alignByBucket(btc, mstr, intervalSec)
+    }
+
+    private fun fetchMstrBarsRange(intervalSec: Int, days: Int): List<LagFormula.Bar> {
+        val interval = when (intervalSec) {
+            60 -> "1m"
+            300 -> "5m"
+            900 -> "15m"
+            3600 -> "60m"
+            else -> "5m"
+        }
+        val range = when {
+            days <= 5 -> "5d"
+            days <= 7 -> "7d"
+            days <= 30 -> "1mo"
+            days <= 60 -> "3mo"
+            else -> "3mo"
+        }
+        val url = "https://query1.finance.yahoo.com/v8/finance/chart/MSTR" +
+            "?interval=$interval&range=$range&includePrePost=false"
+        val body = httpGet(url) ?: return emptyList()
+        return parseYahooChart(body, Int.MAX_VALUE)
+    }
+
+    private fun alignByBucket(
+        btc: List<LagFormula.Bar>,
+        mstr: List<LagFormula.Bar>,
+        intervalSec: Int,
+    ): Pair<List<LagFormula.Bar>, List<LagFormula.Bar>> {
+        if (btc.isEmpty() || mstr.isEmpty()) return Pair(btc, mstr)
+        val bucketMs = intervalSec * 1000L
+        val mstrByTs = HashMap<Long, LagFormula.Bar>(mstr.size)
+        for (b in mstr) mstrByTs[b.timestampMs / bucketMs] = b
+        val btcOut = ArrayList<LagFormula.Bar>()
+        val mstrOut = ArrayList<LagFormula.Bar>()
+        for (b in btc) {
+            val m = mstrByTs[b.timestampMs / bucketMs] ?: continue
+            btcOut.add(b)
+            mstrOut.add(m)
+        }
+        return Pair(btcOut, mstrOut)
     }
 
     /**

@@ -23,6 +23,7 @@ object LagFormula {
         val timestampMs: Long,
         val close: Double,
         val volume: Double,
+        val open: Double = close,
     )
 
     data class CorrelationPoint(val lagBars: Int, val rho: Double)
