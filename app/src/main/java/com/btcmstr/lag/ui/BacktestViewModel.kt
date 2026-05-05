@@ -50,18 +50,21 @@ class BacktestViewModel : ViewModel() {
             )
             try {
                 val days = _state.value.lookbackDays
-                val (btc, mstr) = withContext(Dispatchers.IO) {
-                    service.fetchHistoricalAligned(intervalSec = 300, lookbackDays = days)
+                val fetch = withContext(Dispatchers.IO) {
+                    service.fetchHistoricalAlignedMulti(intervalSec = 300, lookbackDays = days)
                 }
+                val btc = fetch.btc
+                val mstr = fetch.mstr
                 if (btc.size < 300) {
                     _state.value = _state.value.copy(
                         running = false,
-                        error = "ได้ข้อมูลแค่ ${btc.size} bars — ลองช่วงเวลาอื่นหรือรอข้อมูลเพิ่ม"
+                        error = "ได้ข้อมูลแค่ ${btc.size} bars (BTC source: ${fetch.btcSource}) " +
+                            "— ลองช่วงเวลาอื่นหรือรอข้อมูลเพิ่ม"
                     )
                     return@launch
                 }
                 _state.value = _state.value.copy(
-                    progress = "ได้ ${btc.size} bars · กำลัง walk-forward…"
+                    progress = "ได้ ${btc.size} bars จาก ${fetch.btcSource} · กำลัง walk-forward…"
                 )
                 val result = withContext(Dispatchers.Default) {
                     Backtester(_state.value.params).run(btc, mstr)

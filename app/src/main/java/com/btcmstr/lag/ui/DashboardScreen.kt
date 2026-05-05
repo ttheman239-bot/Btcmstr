@@ -98,7 +98,7 @@ private fun PriceRow(state: DashboardState) {
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        PriceBlock("BTC/USDT", state.btcPrice, "Binance", Modifier.weight(1f))
+        PriceBlock("BTC/USD", state.btcPrice, state.btcSource, Modifier.weight(1f))
         PriceBlock("MSTR", state.mstrPrice, "Yahoo", Modifier.weight(1f))
     }
 }

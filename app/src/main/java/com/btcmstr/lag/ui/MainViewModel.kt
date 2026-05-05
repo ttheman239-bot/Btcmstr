@@ -30,6 +30,7 @@ data class DashboardState(
     val mNavCurrent: Double = 0.0,
     val alphaCalibration: Double = 1.0,
     val rawRho: Double = 0.0,
+    val btcSource: String = "—",
     val sharesOutstanding: Double = 348_300_000.0,
     val btcHeld: Double = 818_334.0,
 )
@@ -64,14 +65,17 @@ class MainViewModel : ViewModel() {
         viewModelScope.launch {
             _state.value = _state.value.copy(loading = true, errorMessage = null)
             try {
-                val (btc, mstr) = withContext(Dispatchers.IO) {
-                    service.fetchHistoricalAligned(intervalSec = intervalSec, lookbackDays = 5)
+                val fetch = withContext(Dispatchers.IO) {
+                    service.fetchHistoricalAlignedMulti(intervalSec = intervalSec, lookbackDays = 5)
                 }
+                val btc = fetch.btc
+                val mstr = fetch.mstr
                 if (btc.size < maxLagBars * 3 + 30) {
                     _state.value = _state.value.copy(
                         loading = false,
-                        errorMessage = "ข้อมูลซ้อนทับไม่พอ (BTC=${btc.size}, MSTR=${mstr.size}). " +
-                            "ตลาด NYSE อาจปิด — รอช่วงตลาดเปิด หรือกด refresh ใหม่"
+                        btcSource = fetch.btcSource,
+                        errorMessage = "ข้อมูลซ้อนทับไม่พอ (BTC=${btc.size} จาก ${fetch.btcSource}, " +
+                            "MSTR=${mstr.size}). ตลาด NYSE อาจปิด — รอช่วงตลาดเปิด หรือกด refresh"
                     )
                     return@launch
                 }
@@ -112,6 +116,7 @@ class MainViewModel : ViewModel() {
                     mNavCurrent = ctx.mNavCurrent,
                     alphaCalibration = ctx.alpha,
                     rawRho = ctx.rawRho,
+                    btcSource = fetch.btcSource,
                     errorMessage = null,
                 )
             } catch (e: Exception) {

@@ -1,8 +1,13 @@
 package com.btcmstr.lag
 
 import org.json.JSONArray
+import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 
 /**
@@ -95,67 +100,219 @@ class MarketDataService {
         return if (bars.size > limit) bars.subList(bars.size - limit, bars.size) else bars
     }
 
+    data class HistoricalFetch(
+        val btc: List<LagFormula.Bar>,
+        val mstr: List<LagFormula.Bar>,
+        val btcSource: String,
+        val sourcesTried: List<String>,
+    )
+
     /**
-     * Pages Binance klines back in time so we can cover ranges longer than
-     * the 1000-bar single-call limit. Returns chronological order.
+     * Pages Binance klines back in time. Returns empty on geo-block / parse fail
+     * so the fallback chain can try the next source.
      */
-    fun fetchBtcKlinesRange(
+    fun fetchBtcKlinesRangeBinance(
         intervalSec: Int,
         startTimeMs: Long,
         endTimeMs: Long,
     ): List<LagFormula.Bar> {
-        val interval = when (intervalSec) {
-            60 -> "1m"
-            300 -> "5m"
-            900 -> "15m"
-            3600 -> "1h"
-            else -> "5m"
-        }
-        val all = ArrayList<LagFormula.Bar>()
-        val seen = HashSet<Long>()
-        var cursor = startTimeMs
-        var hops = 0
-        while (cursor < endTimeMs && hops < 30) {
-            val url = "https://api.binance.com/api/v3/klines" +
-                "?symbol=BTCUSDT&interval=$interval&limit=1000" +
-                "&startTime=$cursor&endTime=$endTimeMs"
-            val body = httpGet(url) ?: break
-            val arr = JSONArray(body)
-            if (arr.length() == 0) break
-            var lastClose = cursor
-            for (i in 0 until arr.length()) {
-                val k = arr.getJSONArray(i)
-                val openTime = k.getLong(0)
-                if (!seen.add(openTime)) continue
-                val open = k.getString(1).toDouble()
-                val close = k.getString(4).toDouble()
-                val volume = k.getString(5).toDouble()
-                all.add(LagFormula.Bar(openTime, close, volume, open))
-                lastClose = k.getLong(6)
+        return try {
+            val interval = when (intervalSec) {
+                60 -> "1m"; 300 -> "5m"; 900 -> "15m"; 3600 -> "1h"; else -> "5m"
             }
-            if (lastClose <= cursor) break
-            cursor = lastClose + 1
-            hops++
+            val all = ArrayList<LagFormula.Bar>()
+            val seen = HashSet<Long>()
+            var cursor = startTimeMs
+            var hops = 0
+            while (cursor < endTimeMs && hops < 30) {
+                val url = "https://api.binance.com/api/v3/klines" +
+                    "?symbol=BTCUSDT&interval=$interval&limit=1000" +
+                    "&startTime=$cursor&endTime=$endTimeMs"
+                val body = httpGet(url) ?: break
+                if (body.isBlank() || body.trimStart().startsWith("{")) break
+                val arr = try { JSONArray(body) } catch (_: Exception) { break }
+                if (arr.length() == 0) break
+                var lastClose = cursor
+                for (i in 0 until arr.length()) {
+                    val k = arr.getJSONArray(i)
+                    val openTime = k.getLong(0)
+                    if (!seen.add(openTime)) continue
+                    val open = k.getString(1).toDouble()
+                    val close = k.getString(4).toDouble()
+                    val volume = k.getString(5).toDouble()
+                    all.add(LagFormula.Bar(openTime, close, volume, open))
+                    lastClose = k.getLong(6)
+                }
+                if (lastClose <= cursor) break
+                cursor = lastClose + 1
+                hops++
+            }
+            all.sortBy { it.timestampMs }
+            all
+        } catch (_: Exception) {
+            emptyList()
         }
-        all.sortBy { it.timestampMs }
-        return all
     }
 
     /**
-     * Pulls a long aligned history for backtesting. lookbackDays caps at
-     * Yahoo's 5m maximum (60d) to keep one MSTR call simple.
+     * Kraken public OHLC. Free, no key, generally not geo-blocked in Asia.
+     * Pages with `since` parameter; each call returns up to ~720 bars.
      */
+    fun fetchBtcKlinesRangeKraken(
+        intervalSec: Int,
+        startTimeMs: Long,
+        endTimeMs: Long,
+    ): List<LagFormula.Bar> {
+        val intervalMin = intervalSec / 60
+        if (intervalMin !in listOf(1, 5, 15, 30, 60, 240, 1440)) return emptyList()
+        return try {
+            val all = ArrayList<LagFormula.Bar>()
+            val seen = HashSet<Long>()
+            var sinceSec = startTimeMs / 1000L
+            val endSec = endTimeMs / 1000L
+            var hops = 0
+            while (sinceSec < endSec && hops < 40) {
+                val url = "https://api.kraken.com/0/public/OHLC" +
+                    "?pair=XBTUSDT&interval=$intervalMin&since=$sinceSec"
+                val body = httpGet(url) ?: break
+                val obj = try { JSONObject(body) } catch (_: Exception) { break }
+                val errors = obj.optJSONArray("error")
+                if (errors != null && errors.length() > 0) break
+                val result = obj.optJSONObject("result") ?: break
+                val key = result.keys().asSequence().firstOrNull { it != "last" } ?: break
+                val arr = result.optJSONArray(key) ?: break
+                if (arr.length() == 0) break
+                var maxTs = sinceSec
+                for (i in 0 until arr.length()) {
+                    val k = arr.getJSONArray(i)
+                    val tsSec = k.getLong(0)
+                    if (tsSec * 1000L > endTimeMs) continue
+                    if (!seen.add(tsSec)) continue
+                    val open = k.getString(1).toDouble()
+                    val close = k.getString(4).toDouble()
+                    val volume = k.getString(6).toDouble()
+                    all.add(LagFormula.Bar(tsSec * 1000L, close, volume, open))
+                    if (tsSec > maxTs) maxTs = tsSec
+                }
+                if (maxTs <= sinceSec) break
+                sinceSec = maxTs + intervalSec
+                hops++
+            }
+            all.sortBy { it.timestampMs }
+            all
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * Coinbase Exchange public candles. Free, no key.
+     * Granularity must be one of {60, 300, 900, 3600, 21600, 86400}.
+     */
+    fun fetchBtcKlinesRangeCoinbase(
+        intervalSec: Int,
+        startTimeMs: Long,
+        endTimeMs: Long,
+    ): List<LagFormula.Bar> {
+        if (intervalSec !in listOf(60, 300, 900, 3600, 21600, 86400)) return emptyList()
+        return try {
+            val all = ArrayList<LagFormula.Bar>()
+            val seen = HashSet<Long>()
+            val windowMs = intervalSec * 1000L * 290L
+            var cursor = startTimeMs
+            var hops = 0
+            while (cursor < endTimeMs && hops < 80) {
+                val end = minOf(cursor + windowMs, endTimeMs)
+                val url = "https://api.exchange.coinbase.com/products/BTC-USD/candles" +
+                    "?granularity=$intervalSec&start=${isoUtc(cursor)}&end=${isoUtc(end)}"
+                val body = httpGet(url)
+                if (body == null) {
+                    cursor = end; hops++; continue
+                }
+                val arr = try { JSONArray(body) } catch (_: Exception) {
+                    cursor = end; hops++; continue
+                }
+                for (i in 0 until arr.length()) {
+                    val k = arr.getJSONArray(i)
+                    val tsSec = k.getLong(0)
+                    if (!seen.add(tsSec)) continue
+                    val open = k.getDouble(3)
+                    val close = k.getDouble(4)
+                    val volume = k.getDouble(5)
+                    all.add(LagFormula.Bar(tsSec * 1000L, close, volume, open))
+                }
+                cursor = end
+                hops++
+            }
+            all.sortBy { it.timestampMs }
+            all
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /** Public wrapper used by older callers — defaults to Binance. */
+    fun fetchBtcKlinesRange(
+        intervalSec: Int,
+        startTimeMs: Long,
+        endTimeMs: Long,
+    ): List<LagFormula.Bar> = fetchBtcKlinesRangeBinance(intervalSec, startTimeMs, endTimeMs)
+
+    /**
+     * Tries Binance → Kraken → Coinbase in order, returns the first source
+     * whose payload covers at least [minBars] bars together with its name.
+     */
+    private fun tryBtcSources(
+        intervalSec: Int,
+        startTimeMs: Long,
+        endTimeMs: Long,
+        minBars: Int = 50,
+    ): Pair<List<LagFormula.Bar>, String> {
+        val attempts = listOf<Pair<String, () -> List<LagFormula.Bar>>>(
+            "Binance" to { fetchBtcKlinesRangeBinance(intervalSec, startTimeMs, endTimeMs) },
+            "Kraken" to { fetchBtcKlinesRangeKraken(intervalSec, startTimeMs, endTimeMs) },
+            "Coinbase" to { fetchBtcKlinesRangeCoinbase(intervalSec, startTimeMs, endTimeMs) },
+        )
+        var best: Pair<List<LagFormula.Bar>, String> = emptyList<LagFormula.Bar>() to "(none)"
+        for ((name, fetch) in attempts) {
+            val bars = fetch()
+            if (bars.size >= minBars) return bars to name
+            if (bars.size > best.first.size) best = bars to name
+        }
+        return best
+    }
+
+    /**
+     * Pulls a long aligned history for backtesting. Falls back across BTC
+     * sources if the primary is geo-blocked or empty.
+     */
+    fun fetchHistoricalAlignedMulti(
+        intervalSec: Int = 300,
+        lookbackDays: Int = 30,
+    ): HistoricalFetch {
+        val days = lookbackDays.coerceIn(2, 60)
+        val mstr = fetchMstrBarsRange(intervalSec, days)
+        if (mstr.isEmpty()) return HistoricalFetch(emptyList(), emptyList(), "(none)", listOf("Yahoo failed"))
+        val firstTs = mstr.first().timestampMs
+        val lastTs = mstr.last().timestampMs + intervalSec * 1000L
+        val (btc, source) = tryBtcSources(intervalSec, firstTs, lastTs)
+        val (alignedBtc, alignedMstr) = alignByBucket(btc, mstr, intervalSec)
+        return HistoricalFetch(alignedBtc, alignedMstr, source, listOf("Binance", "Kraken", "Coinbase"))
+    }
+
+    /** Backwards-compatible wrapper that drops the source tag. */
     fun fetchHistoricalAligned(
         intervalSec: Int = 300,
         lookbackDays: Int = 30,
     ): Pair<List<LagFormula.Bar>, List<LagFormula.Bar>> {
-        val days = lookbackDays.coerceIn(2, 60)
-        val mstr = fetchMstrBarsRange(intervalSec, days)
-        if (mstr.isEmpty()) return Pair(emptyList(), emptyList())
-        val firstTs = mstr.first().timestampMs
-        val lastTs = mstr.last().timestampMs + intervalSec * 1000L
-        val btc = fetchBtcKlinesRange(intervalSec, firstTs, lastTs)
-        return alignByBucket(btc, mstr, intervalSec)
+        val r = fetchHistoricalAlignedMulti(intervalSec, lookbackDays)
+        return r.btc to r.mstr
+    }
+
+    private fun isoUtc(ms: Long): String {
+        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+        sdf.timeZone = TimeZone.getTimeZone("UTC")
+        return sdf.format(Date(ms))
     }
 
     private fun fetchMstrBarsRange(intervalSec: Int, days: Int): List<LagFormula.Bar> {
