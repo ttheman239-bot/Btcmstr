@@ -184,11 +184,49 @@ object LagFormula {
     }
 
     /**
+     * α = 1 / mean(|ρ(τ)|) over the curve. Rescales Φ so that "typical" bars
+     * land near 1.0 instead of near zero, regardless of asset-pair correlation
+     * magnitude. Returns 1.0 if the mean is too small to invert.
+     */
+    fun alphaFromCurve(curve: List<CorrelationPoint>): Double {
+        if (curve.isEmpty()) return 1.0
+        val mean = curve.sumOf { abs(it.rho) } / curve.size
+        return if (mean > 1e-3) 1.0 / mean else 1.0
+    }
+
+    /**
+     * Builds the mNAV time series so callers can derive a robust median from
+     * data instead of hardcoding it (mNAV drifts with MSTR price + BTC NAV).
+     */
+    fun mNavSeries(
+        btc: List<Bar>,
+        mstr: List<Bar>,
+        sharesOutstanding: Double,
+        btcHeld: Double,
+    ): DoubleArray {
+        val n = minOf(btc.size, mstr.size)
+        val out = DoubleArray(n)
+        for (i in 0 until n) {
+            out[i] = mNav(mstr[i].close, btc[i].close, sharesOutstanding, btcHeld)
+        }
+        return out
+    }
+
+    /** Median ignoring NaNs / non-finite values. */
+    fun median(values: DoubleArray): Double {
+        val clean = values.filter { it.isFinite() && it > 0.0 }.sorted()
+        if (clean.isEmpty()) return 0.0
+        val n = clean.size
+        return if (n % 2 == 1) clean[n / 2] else (clean[n / 2 - 1] + clean[n / 2]) / 2.0
+    }
+
+    /**
      * Full Φ(t,τ) signal at the most recent bar.
      *
-     * @param alphaCalibration α — typically 1 / mean(|ρ|) from history; 1.0 is fine for live signal sign.
-     * @param mNavMedian rolling median of mNAV (e.g., 30-day).
-     * @param avgVolume V̄ — average normalized volume across both legs.
+     * @param alphaCalibration α — typically 1 / mean(|ρ|) from history; pass 1.0 to disable.
+     * @param mNavMedian rolling median of mNAV (e.g., from mNavSeries() over the lookback).
+     * @param avgVolume V̄ — average normalized volume across both legs (pass 1.0 if your
+     *   inputs are already self-normalized).
      */
     fun phi(
         lagResult: LagResult,

@@ -113,14 +113,12 @@ class Backtester(
         var cash = 1.0
         var openTrade: OpenTrade? = null
         var currentLag: LagFormula.LagResult? = null
+        var currentAlpha: Double = 1.0
+        var currentMNavMedian: Double = params.mNavMedian
         var lastFitIdx = -1
 
-        val avgVolBtc = btc.takeLast(60).map { it.volume }.average().coerceAtLeast(1.0)
-        val avgVolMstr = mstr.takeLast(60).map { it.volume }.average().coerceAtLeast(1.0)
-        val volDenom = sqrt(avgVolBtc * avgVolMstr)
-
         for (t in params.trainBars until n - 1) {
-            // (1) Refit ρ(τ) on the lookback window — strictly historical.
+            // (1) Refit ρ(τ), α, and mNAV median on the lookback window — strictly historical.
             if (currentLag == null || (t - lastFitIdx) >= params.refitEveryBars) {
                 val winBtc = btc.subList(t - params.trainBars, t)
                 val winMstr = mstr.subList(t - params.trainBars, t)
@@ -129,25 +127,35 @@ class Backtester(
                     maxLagBars = params.maxLagBars,
                     barIntervalSec = params.barIntervalSec,
                 )
+                currentAlpha = LagFormula.alphaFromCurve(currentLag.curve)
+                val nav = LagFormula.mNavSeries(
+                    winBtc, winMstr, params.sharesOutstanding, params.btcHeld
+                )
+                currentMNavMedian = LagFormula.median(nav)
                 lastFitIdx = t
             }
             val lag = currentLag!!
+
+            // Volume averages from the same training window — keeps everything causal.
+            val winStart = t - params.trainBars
+            val btcAvgVol = (winStart until t).map { btc[it].volume }.average().coerceAtLeast(1.0)
+            val mstrAvgVol = (winStart until t).map { mstr[it].volume }.average().coerceAtLeast(1.0)
 
             // (2) Compute Φ(t) using only the latest closed bar.
             val utcHour = utcHour(mstr[t].timestampMs)
             val laggedIdx = (t - lag.optimalLagBars).coerceIn(0, n - 1)
             val phi = LagFormula.phi(
                 lagResult = lag,
-                latestBtcVolumeAtLag = btc[laggedIdx].volume / volDenom,
-                latestMstrVolume = mstr[t].volume / volDenom,
+                latestBtcVolumeAtLag = btc[laggedIdx].volume / btcAvgVol,
+                latestMstrVolume = mstr[t].volume / mstrAvgVol,
                 avgVolume = 1.0,
                 latestUtcHour = utcHour,
                 pMstr = mstr[t].close,
                 pBtc = btc[t].close,
                 sharesOutstanding = params.sharesOutstanding,
                 btcHeld = params.btcHeld,
-                mNavMedian = params.mNavMedian,
-                alphaCalibration = 1.0,
+                mNavMedian = currentMNavMedian,
+                alphaCalibration = currentAlpha,
             )
 
             // (3) Exit logic — we react on *next* bar open.
