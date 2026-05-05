@@ -81,14 +81,21 @@ class MainViewModel : ViewModel() {
                 }
                 val s = _state.value
                 val cal = Calendar.getInstance(TimeZone.getTimeZone("UTC"))
-                cal.timeInMillis = mstr.last().timestampMs
+                val nowMs = System.currentTimeMillis()
+                // Skip the in-progress bar so Live matches Backtest's executable boundary.
+                val lastClosedIdx = btc.indexOfLast { it.timestampMs + intervalSec * 1000L <= nowMs - 30_000 }
+                val currentIdx = if (lastClosedIdx >= 0) lastClosedIdx else btc.size - 1
+                cal.timeInMillis = mstr[currentIdx].timestampMs
                 val utcHour = cal.get(Calendar.HOUR_OF_DAY)
-                val currentIdx = btc.size - 1
+                // Match Backtester window (default trainBars = 240) so both pipelines
+                // see the same α calibration and mNAV median.
+                val trainBars = 240
+                val trainStart = (currentIdx - trainBars).coerceAtLeast(0)
                 val ctx = LagFormula.computePhiAt(
                     btc = btc,
                     mstr = mstr,
                     currentIdx = currentIdx,
-                    trainStart = 0,
+                    trainStart = trainStart,
                     maxLagBars = maxLagBars,
                     barIntervalSec = intervalSec,
                     sharesOutstanding = s.sharesOutstanding,
@@ -104,7 +111,7 @@ class MainViewModel : ViewModel() {
                 }
                 _state.value = s.copy(
                     loading = false,
-                    lastUpdateMs = System.currentTimeMillis(),
+                    lastUpdateMs = nowMs,
                     btcPrice = btc[currentIdx].close,
                     mstrPrice = mstr[currentIdx].close,
                     intervalSec = intervalSec,

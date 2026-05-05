@@ -1,5 +1,10 @@
 package com.btcmstr.lag.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -14,11 +19,14 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.btcmstr.lag.LagFormula
+import com.btcmstr.lag.SignalMonitorWorker
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -67,6 +75,7 @@ fun DashboardScreen(viewModel: MainViewModel) {
             state.errorMessage?.let { ErrorBanner(it) }
             PriceRow(state)
             SignalCard(state)
+            AlertSettingsCard()
             ComponentsCard(state)
             LagCard(state)
             CorrelationCurve(state.lag)
@@ -185,6 +194,97 @@ private fun signalExplanation(state: DashboardState): String {
             "BTC ขยับขึ้นก่อน MSTR ${formatLag(state.lag!!.optimalLagSeconds)} — คาดว่า MSTR จะตามขึ้น"
         else ->
             "BTC ขยับลงก่อน MSTR ${formatLag(state.lag!!.optimalLagSeconds)} — คาดว่า MSTR จะตามลง"
+    }
+}
+
+@Composable
+private fun AlertSettingsCard() {
+    val context = LocalContext.current
+    var enabled by remember { mutableStateOf(SignalMonitorWorker.isEnabled(context)) }
+    var hasPermission by remember {
+        mutableStateOf(
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.POST_NOTIFICATIONS
+                ) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val launcher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasPermission = granted
+        if (granted) {
+            SignalMonitorWorker.enable(context)
+            enabled = true
+        }
+    }
+
+    val lastCheck = remember(enabled) { SignalMonitorWorker.lastCheckMs(context) }
+    val lastTransition = remember(enabled) { SignalMonitorWorker.lastTransitionMs(context) }
+
+    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("แจ้งเตือนสัญญาณ (background)", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "ตรวจ Φ ทุก 15 นาที แม้ปิดแอป · แจ้ง entry/exit/flip ทันทีที่สัญญาณเปลี่ยน",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline,
+                    )
+                }
+                Switch(
+                    checked = enabled && hasPermission,
+                    onCheckedChange = { wantOn ->
+                        if (wantOn) {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasPermission) {
+                                launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            } else {
+                                SignalMonitorWorker.enable(context)
+                                enabled = true
+                            }
+                        } else {
+                            SignalMonitorWorker.disable(context)
+                            enabled = false
+                        }
+                    }
+                )
+            }
+            if (enabled) {
+                Text(
+                    "ตรวจล่าสุด: ${fmtAgo(lastCheck)} · transition ล่าสุด: ${fmtAgo(lastTransition)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+                Text(
+                    "ใช้ window 240 bars + threshold 0.7 + computePhiAt() เดียวกับ Backtest — " +
+                        "เวลา/Φ ของ notification ต้องตรงกับ trade ใน Backtest ของวันเดียวกัน",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasPermission) {
+                Text(
+                    "ต้องกดอนุญาต notification ก่อน (จะมี popup ให้เลือก)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+    }
+}
+
+private fun fmtAgo(ts: Long): String {
+    if (ts == 0L) return "—"
+    val mins = (System.currentTimeMillis() - ts) / 60_000L
+    return when {
+        mins < 1 -> "ตอนนี้"
+        mins < 60 -> "${mins}m ที่แล้ว"
+        mins < 1440 -> "${mins / 60}h ที่แล้ว"
+        else -> SimpleDateFormat("MM-dd HH:mm", Locale.US).format(Date(ts))
     }
 }
 
