@@ -252,8 +252,8 @@ object LagFormula {
 
         val phi = alphaCalibration * rho * omega * vNorm * penalty * gate
         val signal = when {
-            phi > 0.7 -> Signal.STRONG_LONG
-            phi < -0.7 -> Signal.STRONG_SHORT
+            phi > STRONG_THRESHOLD -> Signal.STRONG_LONG
+            phi < -STRONG_THRESHOLD -> Signal.STRONG_SHORT
             else -> Signal.NO_TRADE
         }
         return PhiResult(
@@ -264,6 +264,83 @@ object LagFormula {
             mNav = nav,
             mNavPenalty = penalty,
             signal = signal,
+        )
+    }
+
+    /** Threshold that splits NO_TRADE from STRONG_LONG / STRONG_SHORT. */
+    const val STRONG_THRESHOLD = 0.7
+
+    /**
+     * Bundle of everything a caller needs after running the full pipeline at a
+     * specific bar. Live and Backtest both go through this function so the
+     * signal definition is byte-for-byte identical.
+     */
+    data class PhiContext(
+        val phi: PhiResult,
+        val lag: LagResult,
+        val alpha: Double,
+        val mNavMedian: Double,
+        val mNavCurrent: Double,
+        val rawRho: Double,
+        val trainBars: Int,
+    )
+
+    /**
+     * Compute Φ at `currentIdx` using only bars in `[trainStart, currentIdx)`
+     * for the lag fit, α calibration, mNAV median, and volume averages.
+     * Strictly causal — no look-ahead. Returns null if the window is too short.
+     */
+    fun computePhiAt(
+        btc: List<Bar>,
+        mstr: List<Bar>,
+        currentIdx: Int,
+        trainStart: Int,
+        maxLagBars: Int,
+        barIntervalSec: Int,
+        sharesOutstanding: Double,
+        btcHeld: Double,
+        currentUtcHour: Int,
+    ): PhiContext? {
+        val trainLen = currentIdx - trainStart
+        if (trainLen < maxLagBars * 2 + 30) return null
+        if (currentIdx < 1 || currentIdx >= btc.size || currentIdx >= mstr.size) return null
+
+        val winBtc = btc.subList(trainStart, currentIdx)
+        val winMstr = mstr.subList(trainStart, currentIdx)
+        val lag = detectLag(winBtc, winMstr, maxLagBars, barIntervalSec)
+        val alpha = alphaFromCurve(lag.curve)
+        val nav = mNavSeries(winBtc, winMstr, sharesOutstanding, btcHeld)
+        val mNavMedianVal = median(nav)
+
+        val btcAvgVol = winBtc.map { it.volume }.average().coerceAtLeast(1.0)
+        val mstrAvgVol = winMstr.map { it.volume }.average().coerceAtLeast(1.0)
+
+        val laggedIdx = (currentIdx - lag.optimalLagBars).coerceIn(trainStart, currentIdx)
+        val pBtc = btc[currentIdx].close
+        val pMstr = mstr[currentIdx].close
+        val mNavNow = mNav(pMstr, pBtc, sharesOutstanding, btcHeld)
+
+        val phiResult = phi(
+            lagResult = lag,
+            latestBtcVolumeAtLag = btc[laggedIdx].volume / btcAvgVol,
+            latestMstrVolume = mstr[currentIdx].volume / mstrAvgVol,
+            avgVolume = 1.0,
+            latestUtcHour = currentUtcHour,
+            pMstr = pMstr,
+            pBtc = pBtc,
+            sharesOutstanding = sharesOutstanding,
+            btcHeld = btcHeld,
+            mNavMedian = mNavMedianVal,
+            alphaCalibration = alpha,
+        )
+        return PhiContext(
+            phi = phiResult,
+            lag = lag,
+            alpha = alpha,
+            mNavMedian = mNavMedianVal,
+            mNavCurrent = mNavNow,
+            rawRho = lag.rhoAtOptimalLag,
+            trainBars = trainLen,
         )
     }
 }

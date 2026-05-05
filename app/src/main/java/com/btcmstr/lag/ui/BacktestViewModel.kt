@@ -30,11 +30,6 @@ class BacktestViewModel : ViewModel() {
         _state.value = _state.value.copy(lookbackDays = days.coerceIn(5, 60))
     }
 
-    fun setPhiThreshold(t: Double) {
-        val p = _state.value.params.copy(phiThreshold = t.coerceIn(0.05, 2.0))
-        _state.value = _state.value.copy(params = p)
-    }
-
     fun setHoldBars(h: Int) {
         val p = _state.value.params.copy(maxHoldBars = h.coerceIn(1, 96))
         _state.value = _state.value.copy(params = p)
@@ -51,7 +46,7 @@ class BacktestViewModel : ViewModel() {
             _state.value = _state.value.copy(
                 running = true,
                 error = null,
-                progress = "Fetching ${_state.value.lookbackDays}d of 5m bars…",
+                progress = "ดึงข้อมูล ${_state.value.lookbackDays} วัน (5m bars)…",
             )
             try {
                 val days = _state.value.lookbackDays
@@ -61,12 +56,12 @@ class BacktestViewModel : ViewModel() {
                 if (btc.size < 300) {
                     _state.value = _state.value.copy(
                         running = false,
-                        error = "Only got ${btc.size} aligned bars; try a different time or wait for market data."
+                        error = "ได้ข้อมูลแค่ ${btc.size} bars — ลองช่วงเวลาอื่นหรือรอข้อมูลเพิ่ม"
                     )
                     return@launch
                 }
                 _state.value = _state.value.copy(
-                    progress = "Got ${btc.size} aligned 5m bars; running walk-forward…"
+                    progress = "ได้ ${btc.size} bars · กำลัง walk-forward…"
                 )
                 val result = withContext(Dispatchers.Default) {
                     Backtester(_state.value.params).run(btc, mstr)
@@ -80,7 +75,7 @@ class BacktestViewModel : ViewModel() {
             } catch (e: Exception) {
                 _state.value = _state.value.copy(
                     running = false,
-                    error = "Backtest failed: ${e.message ?: e.javaClass.simpleName}",
+                    error = "Backtest ล้มเหลว: ${e.message ?: e.javaClass.simpleName}",
                 )
             }
         }

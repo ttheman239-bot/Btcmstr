@@ -67,19 +67,33 @@ private fun RulesCard() {
     ElevatedCard(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text("วิธีการเทรด (กฎของระบบ)", fontWeight = FontWeight.SemiBold)
-            BulletLine("1.", "ทุก ๆ 5 นาที ระบบคำนวณค่า Φ(t) จากความสัมพันธ์ BTC ↔ MSTR ย้อนหลัง")
-            BulletLine("2.", "ถ้า Φ > +0.50 → เปิด LONG MSTR ที่ราคา open ของแท่งถัดไป (ไม่ใช้ราคาแท่งปัจจุบัน เพื่อกัน look-ahead)")
-            BulletLine("3.", "ถ้า Φ < −0.50 → เปิด SHORT MSTR ที่ราคา open ของแท่งถัดไป")
-            BulletLine("4.", "ปิดออเดอร์เมื่อเกิดเหตุการณ์ใดเหตุการณ์หนึ่ง:")
+            Surface(
+                color = MaterialTheme.colorScheme.primaryContainer,
+                shape = RoundedCornerShape(8.dp),
+            ) {
+                Text(
+                    "✓ Backtest นี้ใช้ฟังก์ชัน computePhiAt() ตัวเดียวกับแท็บ Live — " +
+                        "สัญญาณที่เห็นใน Live ตอนนี้ คือสัญญาณเดียวกับที่ Backtest ใช้ตัดสินเข้า/ออกในอดีต",
+                    modifier = Modifier.padding(10.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+            BulletLine("1.", "ทุก ๆ 5 นาที ระบบคำนวณค่า Φ(t) จาก BTC ↔ MSTR ย้อนหลัง (window 240 bars = 20 ชั่วโมง)")
+            BulletLine("2.", "ถ้า Φ > +0.70 (= STRONG_LONG) → เปิด LONG MSTR ที่ราคา open ของแท่งถัดไป")
+            BulletLine("3.", "ถ้า Φ < −0.70 (= STRONG_SHORT) → เปิด SHORT MSTR ที่ราคา open ของแท่งถัดไป")
+            BulletLine("4.", "ปิดออเดอร์เมื่อ:")
             Text(
-                "      • ถือครบจำนวนแท่งสูงสุด (Max hold)\n" +
-                    "      • สัญญาณกลับด้าน (Φ พลิกข้าม threshold)\n" +
+                "      • Φ พลิกข้าม threshold (สัญญาณกลับด้าน)\n" +
+                    "      • Φ ลดลงต่ำกว่า ±0.70 = NO_TRADE (สัญญาณอ่อน)\n" +
+                    "      • ถือครบจำนวนแท่งสูงสุด (safety net)\n" +
                     "      • ใกล้ปิดตลาด NYSE (ไม่ถือข้ามคืน)\n" +
-                    "      • ข้อมูลในช่วง backtest หมด",
+                    "      • ข้อมูล backtest หมด",
                 style = MaterialTheme.typography.bodySmall,
             )
             BulletLine("5.", "ค่าธรรมเนียม: หักทุก trade ทั้งขาเข้า + ขาออก (default 5 bps × 2 = 0.10%)")
-            BulletLine("6.", "เปิดออเดอร์ได้เฉพาะช่วงตลาด NYSE เปิดเท่านั้น (premarket + RTH)")
+            BulletLine("6.", "เปิดออเดอร์ได้เฉพาะช่วงตลาด NYSE เปิดเท่านั้น (เพราะ ω(t) < 1 ตอนตลาดปิด → กด Φ ต่ำกว่า threshold)")
             Spacer(Modifier.height(4.dp))
             Surface(
                 color = MaterialTheme.colorScheme.tertiaryContainer,
@@ -119,14 +133,17 @@ private fun ParametersCard(state: BacktestUiState, vm: BacktestViewModel) {
                 display = "${state.lookbackDays} วัน",
                 onChange = { vm.setLookbackDays(it.toInt()) },
             )
-            SliderRow(
-                label = "Φ threshold (เกณฑ์เปิดออเดอร์)",
-                value = p.phiThreshold.toFloat(),
-                valueRange = 0.1f..1.5f,
-                steps = 27,
-                display = "%.2f".format(p.phiThreshold),
-                onChange = { vm.setPhiThreshold(it.toDouble()) },
-            )
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(8.dp),
+            ) {
+                Text(
+                    "Threshold = ±0.70 (fixed, = LagFormula.STRONG_THRESHOLD เดียวกับ Live)",
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
             SliderRow(
                 label = "ถือสูงสุด (แท่ง 5 นาที)",
                 value = p.maxHoldBars.toFloat(),
@@ -407,7 +424,7 @@ private fun TradeRow(index: Int, trade: Backtester.Trade, costBps: Double) {
     val priceChangePct = (trade.exitPrice - trade.entryPrice) / trade.entryPrice * 100.0
     val reasonTh = when (trade.exitReason) {
         Backtester.ExitReason.MAX_HOLD -> "ครบเวลาถือ (max hold)"
-        Backtester.ExitReason.OPPOSITE_SIGNAL -> "สัญญาณกลับด้าน"
+        Backtester.ExitReason.SIGNAL_FLIP -> "สัญญาณเปลี่ยน (flip/fade)"
         Backtester.ExitReason.SESSION_END -> "ใกล้ปิดตลาด"
         Backtester.ExitReason.EOD -> "หมดข้อมูล backtest"
     }
@@ -534,7 +551,7 @@ private fun ExitReasonsCard(trades: List<Backtester.Trade>) {
                 val totalPnl = pnlByReason[r] ?: 0.0
                 val labelTh = when (r) {
                     Backtester.ExitReason.MAX_HOLD -> "ครบเวลาถือ"
-                    Backtester.ExitReason.OPPOSITE_SIGNAL -> "สัญญาณกลับด้าน"
+                    Backtester.ExitReason.SIGNAL_FLIP -> "สัญญาณเปลี่ยน (flip/fade)"
                     Backtester.ExitReason.SESSION_END -> "ใกล้ปิดตลาด"
                     Backtester.ExitReason.EOD -> "หมดข้อมูล"
                 }

@@ -3,7 +3,6 @@ package com.btcmstr.lag
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.ln
-import kotlin.math.sign
 import kotlin.math.sqrt
 import java.util.Calendar
 import java.util.TimeZone
@@ -11,32 +10,34 @@ import java.util.TimeZone
 /**
  * Walk-forward backtester for the Φ(t,τ) signal.
  *
- * Correctness guarantees:
- *  • The lag fit at time t uses only bars [t - trainBars .. t-1] (no look-ahead).
- *  • Φ(t) is computed from the *current* close-bar; trades execute at the
- *    next bar's open. This emulates a trader who sees a bar print and reacts
- *    on the following bar's open auction.
- *  • Costs are charged round-trip on each closed trade.
- *  • Trades are gated to NYSE RTH (ω(t) ≥ 1.0) and are force-closed before the
- *    daily session boundary so the strategy never holds overnight gap risk
- *    unless the user explicitly enables `allowOvernight`.
+ * The signal generation is delegated to [LagFormula.computePhiAt] — the same
+ * function the Live tab calls — so by construction the backtest reproduces
+ * exactly what a trader watching Live would have seen at every historical bar.
+ *
+ *   • Lag fit, α calibration, mNAV median, and volume averages are all computed
+ *     on the rolling window `[t - trainBars, t)`. No look-ahead.
+ *   • Entry rule: open when `phi.signal == STRONG_LONG / STRONG_SHORT`
+ *     (i.e., |Φ| > LagFormula.STRONG_THRESHOLD = 0.7) — identical to Live.
+ *   • Exit rule: close when the live signal would change — the new signal is
+ *     either NO_TRADE (Φ falls below threshold) or the opposite STRONG. The
+ *     two safety nets are: max-hold-bars cap, and forced flat at NYSE close
+ *     unless `allowOvernight = true`.
+ *   • Execution: trades fill at the *next* bar's open and round-trip cost is
+ *     deducted on the closed trade.
  */
 class Backtester(
     private val params: BacktestParams = BacktestParams(),
 ) {
 
     data class BacktestParams(
-        val trainBars: Int = 240,            // window used to fit ρ(τ)
-        val refitEveryBars: Int = 24,        // re-fit cadence
-        val maxLagBars: Int = 24,            // sweep ±24 bars (~2h on 5m)
-        val barIntervalSec: Int = 300,       // 5-minute bars
-        val phiThreshold: Double = 0.5,      // |Φ| entry trigger
-        val maxHoldBars: Int = 6,            // 30 min on 5m bars
-        val costBpsPerSide: Double = 5.0,    // 0.05% per side ≈ retail MSTR
+        val trainBars: Int = 240,
+        val maxLagBars: Int = 24,
+        val barIntervalSec: Int = 300,
+        val maxHoldBars: Int = 12,
+        val costBpsPerSide: Double = 5.0,
         val allowOvernight: Boolean = false,
         val sharesOutstanding: Double = 348_300_000.0,
         val btcHeld: Double = 818_334.0,
-        val mNavMedian: Double = 1.85,
     )
 
     data class Trade(
@@ -54,7 +55,7 @@ class Backtester(
         val exitReason: ExitReason,
     )
 
-    enum class ExitReason { MAX_HOLD, OPPOSITE_SIGNAL, SESSION_END, EOD }
+    enum class ExitReason { SIGNAL_FLIP, MAX_HOLD, SESSION_END, EOD }
 
     data class EquityPoint(val timeMs: Long, val equity: Double)
 
@@ -104,7 +105,7 @@ class Backtester(
                 trades = emptyList(),
                 equityCurve = listOf(EquityPoint(System.currentTimeMillis(), 1.0)),
                 metrics = emptyMetrics(),
-                warning = "Need at least ${params.trainBars + 50} bars; have $n",
+                warning = "ต้องการอย่างน้อย ${params.trainBars + 50} bars แต่มีแค่ $n",
             )
         }
 
@@ -112,107 +113,80 @@ class Backtester(
         val equity = ArrayList<EquityPoint>(n)
         var cash = 1.0
         var openTrade: OpenTrade? = null
-        var currentLag: LagFormula.LagResult? = null
-        var currentAlpha: Double = 1.0
-        var currentMNavMedian: Double = params.mNavMedian
-        var lastFitIdx = -1
 
         for (t in params.trainBars until n - 1) {
-            // (1) Refit ρ(τ), α, and mNAV median on the lookback window — strictly historical.
-            if (currentLag == null || (t - lastFitIdx) >= params.refitEveryBars) {
-                val winBtc = btc.subList(t - params.trainBars, t)
-                val winMstr = mstr.subList(t - params.trainBars, t)
-                currentLag = LagFormula.detectLag(
-                    winBtc, winMstr,
-                    maxLagBars = params.maxLagBars,
-                    barIntervalSec = params.barIntervalSec,
-                )
-                currentAlpha = LagFormula.alphaFromCurve(currentLag.curve)
-                val nav = LagFormula.mNavSeries(
-                    winBtc, winMstr, params.sharesOutstanding, params.btcHeld
-                )
-                currentMNavMedian = LagFormula.median(nav)
-                lastFitIdx = t
-            }
-            val lag = currentLag!!
-
-            // Volume averages from the same training window — keeps everything causal.
-            val winStart = t - params.trainBars
-            val btcAvgVol = (winStart until t).map { btc[it].volume }.average().coerceAtLeast(1.0)
-            val mstrAvgVol = (winStart until t).map { mstr[it].volume }.average().coerceAtLeast(1.0)
-
-            // (2) Compute Φ(t) using only the latest closed bar.
             val utcHour = utcHour(mstr[t].timestampMs)
-            val laggedIdx = (t - lag.optimalLagBars).coerceIn(0, n - 1)
-            val phi = LagFormula.phi(
-                lagResult = lag,
-                latestBtcVolumeAtLag = btc[laggedIdx].volume / btcAvgVol,
-                latestMstrVolume = mstr[t].volume / mstrAvgVol,
-                avgVolume = 1.0,
-                latestUtcHour = utcHour,
-                pMstr = mstr[t].close,
-                pBtc = btc[t].close,
+            val ctx = LagFormula.computePhiAt(
+                btc = btc,
+                mstr = mstr,
+                currentIdx = t,
+                trainStart = t - params.trainBars,
+                maxLagBars = params.maxLagBars,
+                barIntervalSec = params.barIntervalSec,
                 sharesOutstanding = params.sharesOutstanding,
                 btcHeld = params.btcHeld,
-                mNavMedian = currentMNavMedian,
-                alphaCalibration = currentAlpha,
-            )
+                currentUtcHour = utcHour,
+            ) ?: continue
 
-            // (3) Exit logic — we react on *next* bar open.
+            val signal = ctx.phi.signal
             val tNext = t + 1
-            val held = openTrade?.let { tNext - it.entryIdx } ?: 0
-            val open = openTrade
-            if (open != null) {
+
+            // Exit logic — react on next bar's open.
+            val curOpen = openTrade
+            if (curOpen != null) {
+                val held = tNext - curOpen.entryIdx
                 val sessionEnd = !params.allowOvernight && isLastSessionBarUtc(mstr, tNext)
-                val opposite = sign(phi.phi) * open.direction.toDouble() < 0 &&
-                    abs(phi.phi) > params.phiThreshold
+                val flipped = signal != LagFormula.Signal.NO_TRADE &&
+                    signal.dirSign() != curOpen.direction
+                val faded = signal == LagFormula.Signal.NO_TRADE
                 val exhausted = held >= params.maxHoldBars
-                if (exhausted || sessionEnd || opposite || tNext == n - 1) {
+                val dataEnd = tNext == n - 1
+                val shouldClose = exhausted || sessionEnd || flipped || faded || dataEnd
+                if (shouldClose) {
                     val exitPrice = mstr[tNext].open
-                    val gross = ln(exitPrice / open.entryPrice) * open.direction
+                    val gross = ln(exitPrice / curOpen.entryPrice) * curOpen.direction
                     val cost = 2.0 * params.costBpsPerSide / 10_000.0
                     val net = gross - cost
                     cash *= exp(net)
+                    val reason = when {
+                        flipped || faded -> ExitReason.SIGNAL_FLIP
+                        exhausted -> ExitReason.MAX_HOLD
+                        sessionEnd -> ExitReason.SESSION_END
+                        else -> ExitReason.EOD
+                    }
                     trades.add(
                         Trade(
-                            entryTimeMs = open.entryTimeMs,
+                            entryTimeMs = curOpen.entryTimeMs,
                             exitTimeMs = mstr[tNext].timestampMs,
-                            direction = open.direction,
-                            entryPrice = open.entryPrice,
+                            direction = curOpen.direction,
+                            entryPrice = curOpen.entryPrice,
                             exitPrice = exitPrice,
-                            phiAtEntry = open.phiAtEntry,
-                            rhoAtEntry = open.rhoAtEntry,
-                            lagSecondsAtEntry = open.lagSecondsAtEntry,
+                            phiAtEntry = curOpen.phiAtEntry,
+                            rhoAtEntry = curOpen.rhoAtEntry,
+                            lagSecondsAtEntry = curOpen.lagSecondsAtEntry,
                             grossPnlPct = (exp(gross) - 1.0) * 100.0,
                             netPnlPct = (exp(net) - 1.0) * 100.0,
                             barsHeld = held,
-                            exitReason = when {
-                                exhausted -> ExitReason.MAX_HOLD
-                                opposite -> ExitReason.OPPOSITE_SIGNAL
-                                sessionEnd -> ExitReason.SESSION_END
-                                else -> ExitReason.EOD
-                            },
+                            exitReason = reason,
                         )
                     )
                     openTrade = null
                 }
             }
 
-            // (4) Entry logic — only during NYSE RTH (ω≥1.0); enter at next-bar open.
-            if (openTrade == null && tNext < n - 1) {
-                val canEnter = phi.sessionWeight >= 1.0 && abs(phi.phi) > params.phiThreshold
-                if (canEnter) {
-                    val dir = if (phi.phi > 0) 1 else -1
-                    openTrade = OpenTrade(
-                        entryIdx = tNext,
-                        entryTimeMs = mstr[tNext].timestampMs,
-                        entryPrice = mstr[tNext].open,
-                        direction = dir,
-                        phiAtEntry = phi.phi,
-                        rhoAtEntry = phi.rho,
-                        lagSecondsAtEntry = lag.optimalLagSeconds,
-                    )
-                }
+            // Entry logic — exact same condition as Live's banner.
+            if (openTrade == null && tNext < n - 1 &&
+                signal != LagFormula.Signal.NO_TRADE
+            ) {
+                openTrade = OpenTrade(
+                    entryIdx = tNext,
+                    entryTimeMs = mstr[tNext].timestampMs,
+                    entryPrice = mstr[tNext].open,
+                    direction = signal.dirSign(),
+                    phiAtEntry = ctx.phi.phi,
+                    rhoAtEntry = ctx.phi.rho,
+                    lagSecondsAtEntry = ctx.lag.optimalLagSeconds,
+                )
             }
 
             equity.add(EquityPoint(mstr[t].timestampMs, cash))
@@ -224,6 +198,12 @@ class Backtester(
             equityCurve = equity,
             metrics = computeMetrics(trades, equity),
         )
+    }
+
+    private fun LagFormula.Signal.dirSign(): Int = when (this) {
+        LagFormula.Signal.STRONG_LONG -> 1
+        LagFormula.Signal.STRONG_SHORT -> -1
+        LagFormula.Signal.NO_TRADE -> 0
     }
 
     private fun emptyMetrics() = Metrics(
@@ -242,7 +222,6 @@ class Backtester(
         else
             0.0
 
-        // Per-bar log returns from equity curve for Sharpe/Sortino
         val perBarLogReturns = ArrayList<Double>(equity.size)
         for (i in 1 until equity.size) {
             val r = ln(equity[i].equity / equity[i - 1].equity.coerceAtLeast(1e-9))
@@ -254,7 +233,6 @@ class Backtester(
         val maxDDPct = maxDrawdownPct(equity)
 
         val wins = trades.count { it.netPnlPct > 0 }
-        val losses = trades.size - wins
         val grossProfit = trades.filter { it.netPnlPct > 0 }.sumOf { it.netPnlPct }
         val grossLoss = trades.filter { it.netPnlPct <= 0 }.sumOf { -it.netPnlPct }
         val pf = if (grossLoss > 1e-9) grossProfit / grossLoss else
