@@ -59,16 +59,38 @@ class SignalMonitorWorker(
                 currentUtcHour = utcHour,
             ) ?: return Result.success()
 
-            val newSignal = ctx.phi.signal
-            val prev = prefs.getString(KEY_LAST_SIGNAL, LagFormula.Signal.NO_TRADE.name)
-                ?.let { runCatching { LagFormula.Signal.valueOf(it) }.getOrDefault(LagFormula.Signal.NO_TRADE) }
-                ?: LagFormula.Signal.NO_TRADE
             val barTimeMs = mstr[currentIdx].timestampMs
+            val mstrPrice = mstr[currentIdx].close
+            val btcPrice = btc[currentIdx].close
 
-            if (newSignal != prev) {
-                postTransitionNotification(prev, newSignal, ctx, btc[currentIdx].close, mstr[currentIdx].close, barTimeMs, fetch.btcSource)
+            // (1) Run paper trader
+            val store = PaperTradeStore(context)
+            val portfolio = store.load()
+            val tickResult = PaperTrader.tick(
+                ctx = ctx,
+                mstrPriceNow = mstrPrice,
+                currentBarTimeMs = barTimeMs,
+                currentTimeMs = nowMs,
+                params = PaperTrader.Params(),
+                portfolio = portfolio,
+                sourceUsed = fetch.btcSource,
+            )
+            store.save(tickResult.portfolio)
+
+            // (2) Notify on action
+            if (tickResult.action != PaperTrader.Action.NONE) {
+                postActionNotification(
+                    action = tickResult.action,
+                    closedTrade = tickResult.closedTrade,
+                    portfolioAfter = tickResult.portfolio,
+                    ctx = ctx,
+                    btcPrice = btcPrice,
+                    mstrPrice = mstrPrice,
+                    barTimeMs = barTimeMs,
+                    btcSource = fetch.btcSource,
+                )
                 prefs.edit()
-                    .putString(KEY_LAST_SIGNAL, newSignal.name)
+                    .putString(KEY_LAST_SIGNAL, ctx.phi.signal.name)
                     .putLong(KEY_LAST_TRANSITION_MS, nowMs)
                     .putLong(KEY_LAST_BAR_MS, barTimeMs)
                     .apply()
@@ -80,9 +102,10 @@ class SignalMonitorWorker(
         }
     }
 
-    private fun postTransitionNotification(
-        prev: LagFormula.Signal,
-        next: LagFormula.Signal,
+    private fun postActionNotification(
+        action: PaperTrader.Action,
+        closedTrade: PaperTrader.Trade?,
+        portfolioAfter: PaperTrader.Portfolio,
         ctx: LagFormula.PhiContext,
         btcPrice: Double,
         mstrPrice: Double,
@@ -95,49 +118,60 @@ class SignalMonitorWorker(
         val phiStr = "%+.3f".format(ctx.phi.phi)
         val rhoStr = "%+.3f".format(ctx.rawRho)
         val lagStr = formatLagSeconds(ctx.lag.optimalLagSeconds)
+        val equityUsd = portfolioAfter.startEquity * portfolioAfter.equity
+        val totalRet = (portfolioAfter.equity - 1.0) * 100.0
+        val equityLine = "Paper: $%,.2f (%s%%)".format(equityUsd, "%+.2f".format(totalRet))
 
-        when {
-            prev == LagFormula.Signal.NO_TRADE && next == LagFormula.Signal.STRONG_LONG ->
+        when (action) {
+            PaperTrader.Action.OPENED_LONG ->
                 Notifier.postSignalChange(
                     applicationContext,
-                    title = "🟢 ENTRY LONG MSTR",
-                    body = "เข้า LONG ที่ราคาเปิดแท่งถัดไป (~$%.2f)\n".format(mstrPrice) +
-                        "Φ=$phiStr · ρ=$rhoStr · τ*=$lagStr · BTC=$%.0f ($btcSource)\n".format(btcPrice) +
-                        "เวลาบาร์: $ts",
+                    title = "🟢 Paper เข้า LONG MSTR",
+                    body = "เข้า LONG @ $%.2f · Φ=$phiStr · ρ=$rhoStr · τ*=$lagStr\n".format(mstrPrice) +
+                        "BTC=$%.0f ($btcSource) · $ts\n".format(btcPrice) +
+                        equityLine,
                     kind = Notifier.SignalChangeKind.ENTRY_LONG,
                 )
-            prev == LagFormula.Signal.NO_TRADE && next == LagFormula.Signal.STRONG_SHORT ->
+            PaperTrader.Action.OPENED_SHORT ->
                 Notifier.postSignalChange(
                     applicationContext,
-                    title = "🔴 ENTRY SHORT MSTR",
-                    body = "เข้า SHORT ที่ราคาเปิดแท่งถัดไป (~$%.2f)\n".format(mstrPrice) +
-                        "Φ=$phiStr · ρ=$rhoStr · τ*=$lagStr · BTC=$%.0f ($btcSource)\n".format(btcPrice) +
-                        "เวลาบาร์: $ts",
+                    title = "🔴 Paper เข้า SHORT MSTR",
+                    body = "เข้า SHORT @ $%.2f · Φ=$phiStr · ρ=$rhoStr · τ*=$lagStr\n".format(mstrPrice) +
+                        "BTC=$%.0f ($btcSource) · $ts\n".format(btcPrice) +
+                        equityLine,
                     kind = Notifier.SignalChangeKind.ENTRY_SHORT,
                 )
-            (prev == LagFormula.Signal.STRONG_LONG || prev == LagFormula.Signal.STRONG_SHORT) &&
-                next == LagFormula.Signal.NO_TRADE ->
+            PaperTrader.Action.CLOSED -> {
+                val t = closedTrade ?: return
+                val side = if (t.direction > 0) "LONG" else "SHORT"
                 Notifier.postSignalChange(
                     applicationContext,
-                    title = "⚪ EXIT (signal faded)",
-                    body = "ปิดออเดอร์ (signal กลับเป็น NO_TRADE) ที่ราคาเปิดแท่งถัดไป (~$%.2f)\n".format(mstrPrice) +
-                        "Φ=$phiStr · ρ=$rhoStr\n" +
-                        "เวลาบาร์: $ts",
+                    title = "⚪ Paper ปิด $side: %s%%".format("%+.2f".format(t.netPnlPct)),
+                    body = "เข้า $%.2f → ออก $%.2f (ถือ %d แท่ง)\n".format(t.entryPrice, t.exitPrice, t.barsHeld) +
+                        "Net %s%% (gross %s%%, fee 0.10%%)\n".format(
+                            "%+.2f".format(t.netPnlPct), "%+.2f".format(t.grossPnlPct),
+                        ) +
+                        "เหตุผล: ${t.exitReason} · $ts\n" +
+                        equityLine,
                     kind = Notifier.SignalChangeKind.EXIT,
                 )
-            (prev == LagFormula.Signal.STRONG_LONG && next == LagFormula.Signal.STRONG_SHORT) ||
-                (prev == LagFormula.Signal.STRONG_SHORT && next == LagFormula.Signal.STRONG_LONG) -> {
-                val newDir = if (next == LagFormula.Signal.STRONG_LONG) "LONG" else "SHORT"
+            }
+            PaperTrader.Action.FLIPPED_LONG, PaperTrader.Action.FLIPPED_SHORT -> {
+                val t = closedTrade ?: return
+                val newSide = if (action == PaperTrader.Action.FLIPPED_LONG) "LONG" else "SHORT"
+                val oldSide = if (t.direction > 0) "LONG" else "SHORT"
                 Notifier.postSignalChange(
                     applicationContext,
-                    title = "🔁 FLIP → $newDir",
-                    body = "สัญญาณกลับด้าน — ปิดเก่า + เปิดใหม่ฝั่ง $newDir ที่ราคาเปิดแท่งถัดไป (~$%.2f)\n".format(mstrPrice) +
-                        "Φ=$phiStr · ρ=$rhoStr · τ*=$lagStr\n" +
-                        "เวลาบาร์: $ts",
+                    title = "🔁 Paper FLIP $oldSide → $newSide",
+                    body = "ปิด $oldSide: $%.2f → $%.2f (%s%%)\n".format(
+                        t.entryPrice, t.exitPrice, "%+.2f".format(t.netPnlPct),
+                    ) +
+                        "เปิด $newSide ใหม่ @ $%.2f · Φ=$phiStr\n".format(mstrPrice) +
+                        "$ts · $equityLine",
                     kind = Notifier.SignalChangeKind.FLIP,
                 )
             }
-            else -> Unit
+            PaperTrader.Action.NONE -> Unit
         }
     }
 

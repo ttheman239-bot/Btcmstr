@@ -29,21 +29,25 @@ import com.btcmstr.lag.ui.BacktestScreen
 import com.btcmstr.lag.ui.BacktestViewModel
 import com.btcmstr.lag.ui.DashboardScreen
 import com.btcmstr.lag.ui.MainViewModel
+import com.btcmstr.lag.ui.PaperScreen
+import com.btcmstr.lag.ui.PaperViewModel
 
 class MainActivity : ComponentActivity() {
 
     private val liveVm: MainViewModel by viewModels()
+    private val paperVm: PaperViewModel by viewModels()
     private val backtestVm: BacktestViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Notifier.ensureChannel(this)
         setContent {
             BtcMstrTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background,
                 ) {
-                    RootTabs(liveVm, backtestVm)
+                    RootTabs(liveVm, paperVm, backtestVm)
                 }
             }
         }
@@ -51,9 +55,13 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun RootTabs(liveVm: MainViewModel, backtestVm: BacktestViewModel) {
+private fun RootTabs(
+    liveVm: MainViewModel,
+    paperVm: PaperViewModel,
+    backtestVm: BacktestViewModel,
+) {
     var selected by remember { mutableIntStateOf(0) }
-    val tabs = listOf("Live", "Backtest")
+    val tabs = listOf("Live", "Paper", "Backtest")
     Column(Modifier.fillMaxSize()) {
         TabRow(selectedTabIndex = selected) {
             tabs.forEachIndexed { i, label ->
@@ -66,7 +74,8 @@ private fun RootTabs(liveVm: MainViewModel, backtestVm: BacktestViewModel) {
         }
         when (selected) {
             0 -> DashboardScreen(liveVm)
-            1 -> BacktestScreen(backtestVm)
+            1 -> PaperScreen(paperVm)
+            2 -> BacktestScreen(backtestVm)
         }
     }
 }
